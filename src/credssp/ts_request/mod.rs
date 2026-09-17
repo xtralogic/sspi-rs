@@ -211,9 +211,12 @@ impl TsRequest {
         }
 
         /* [5] clientNonce (OCTET STRING) */
-        if self.version >= 5
-            && let Some(client_nonce) = self.client_nonce.as_ref()
-        {
+        //
+        // Presence alone decides whether the field is emitted. `self.version` is our own advertised
+        // version, not the negotiated one, so gating on it here would always pass and would hide the
+        // fact that the decision belongs to whoever populated `client_nonce` -- they are the only
+        // ones who know the peer's version.
+        if let Some(client_nonce) = self.client_nonce.as_ref() {
             ber::write_sequence_octet_string(&mut buffer, 5, client_nonce)?;
         }
 
@@ -237,7 +240,7 @@ impl TsRequest {
 
     fn ts_request_len(&self) -> io::Result<u16> {
         let (error_code_len, error_code_context_len) = get_error_code_len(self.version, self.error_code);
-        let client_nonce_len = if self.client_nonce.is_some() && self.version >= 5 {
+        let client_nonce_len = if self.client_nonce.is_some() {
             NONCE_FIELD_LEN
         } else {
             0

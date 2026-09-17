@@ -365,6 +365,38 @@ fn decode_without_client_nonce() {
     assert!(ts_request.client_nonce.is_none());
 }
 
+/// A `TsRequest` with no nonce must not leave a `[5] clientNonce` tag on the wire, and
+/// `buffer_len` must agree with what is actually encoded.
+///
+/// This is what a pre-CredSSP-5 peer (Windows Server 2008 R2 advertises version 2 or 3) has to
+/// receive: its TSRequest definition has no `[5]` field, so a stray contextual tag can make the
+/// whole structure fail to decode. See the `negotiated_version >= 5` guard in
+/// `CredSspClient::process_impl`.
+#[test]
+fn encode_without_client_nonce_omits_the_field() {
+    let ts_request = TsRequest {
+        nego_tokens: Some(NTLM_3_PHASE_NEGO_TOKEN.to_vec()),
+        auth_info: None,
+        pub_key_auth: Some(NTLM_3_PHASE_PUB_KEY_AUTH.to_vec()),
+        error_code: None,
+        client_nonce: None,
+        version: TS_REQUEST_VERSION,
+    };
+
+    let ts_request_len = ts_request.buffer_len().unwrap();
+    let mut buffer = Vec::with_capacity(ts_request_len.into());
+    ts_request.encode_ts_request(&mut buffer).unwrap();
+
+    assert_eq!(usize::from(ts_request_len), buffer.len());
+
+    // The nonce is the last field, so the encoding is the with-nonce one minus the nonce.
+    assert_eq!(
+        buffer.len(),
+        NTLM_3_PHASE_TS_REQUEST.len() - usize::from(NONCE_FIELD_LEN)
+    );
+    assert!(TsRequest::from_buffer(&buffer).unwrap().client_nonce.is_none());
+}
+
 #[test]
 fn ntlm_encode_first_phase_with_nego_token_and_client_nonce() {
     let expected_buffer = NTLM_1_PHASE_TS_REQUEST;

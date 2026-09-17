@@ -109,6 +109,89 @@ fn credssp_ntlm() {
     run_credssp(&mut client, &mut server, &auth_identity, &mut network_client);
 }
 
+/// CredSSP against a peer that predates the `clientNonce` field must fall back to the legacy public
+/// key echo and must not put a `[5] clientNonce` tag on the wire.
+///
+/// Windows Server 2008 R2 advertises CredSSP version 2 or 3. Its TSRequest definition has no `[5]`
+/// field, so a stray contextual tag can make the whole structure fail to decode -- and because the
+/// peer never gets far enough to build a CredSSP response, the failure surfaces as a dropped TLS
+/// session rather than a `TSRequest.errorCode`.
+///
+/// Related: Devolutions/IronRDP#1469.
+#[test]
+fn credssp_ntlm_with_legacy_peer_omits_client_nonce() {
+    const LEGACY_VERSION: u32 = 3;
+
+    let auth_identity = AuthIdentity {
+        username: Username::parse("test_user").unwrap(),
+        password: Secret::from("test_password".to_owned()),
+    };
+    let credentials = Credentials::AuthIdentity(auth_identity.clone());
+
+    let ntlm_config = NtlmConfig {
+        client_computer_name: Some("DESKTOP-3D83IAN.example.com".to_owned()),
+    };
+
+    // The client advertises the current version; only the server is legacy, which is the direction
+    // that matters for the reported bug.
+    let mut client = CredSspClient::new(
+        PUBLIC_KEY.to_vec(),
+        credentials,
+        CredSspMode::WithCredentials,
+        ClientMode::Ntlm(ntlm_config.clone()),
+        TARGET_NAME.to_owned(),
+    )
+    .unwrap();
+
+    let mut server = CredSspServer::new_with_version(
+        PUBLIC_KEY.to_vec(),
+        CredentialsProxyImpl::new(&auth_identity),
+        LEGACY_VERSION,
+        ServerMode::Ntlm(ntlm_config),
+    )
+    .unwrap();
+
+    let network_client = NetworkClientMock { kdc: KdcMock::empty() };
+    let mut ts_request = TsRequest {
+        version: LEGACY_VERSION,
+        ..Default::default()
+    };
+
+    for _ in 0..4 {
+        ts_request = match client
+            .process(mem::take(&mut ts_request))
+            .resolve_with_client(&network_client)
+            .unwrap()
+        {
+            ClientState::ReplyNeeded(ts_request) => ts_request,
+            ClientState::FinalMessage(ts_request) => ts_request,
+        };
+
+        assert!(
+            ts_request.client_nonce.is_none(),
+            "the client must not send a clientNonce to a CredSSP version {LEGACY_VERSION} peer"
+        );
+
+        // The field is omitted on the wire, not merely left out of the struct.
+        let mut encoded = Vec::new();
+        ts_request.encode_ts_request(&mut encoded).unwrap();
+        assert!(
+            TsRequest::from_buffer(&encoded).unwrap().client_nonce.is_none(),
+            "the encoded TSRequest must not carry a [5] clientNonce tag"
+        );
+
+        match server.process(ts_request).resolve_with_client(&network_client).unwrap() {
+            ServerState::ReplyNeeded(server_ts_request) => ts_request = server_ts_request,
+            ServerState::Finished(received_auth_identity) => {
+                assert_eq!(auth_identity, received_auth_identity);
+                return;
+            }
+        };
+    }
+
+    panic!("CredSSP authentication should not exceed 4 steps")
+}
+
 #[test]
 fn credssp_kerberos() {
     // CredSSP with Kerberos inside requires SPNEGO. We cannot use Kerberos inside CredSSP without SPNEGO.

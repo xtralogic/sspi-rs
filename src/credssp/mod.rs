@@ -350,10 +350,11 @@ impl CredSspClient {
                 if result.status == SecurityStatus::Ok {
                     debug!("CredSSp finished NLA stage.");
 
-                    let peer_version =
-                        self.context.as_ref().unwrap().peer_version.expect(
-                            "An encrypt public key client function cannot be fired without any incoming TSRequest",
-                        );
+                    let negotiated_version = self
+                        .context
+                        .as_ref()
+                        .expect("Should not panic because the CredSSP context is set before")
+                        .negotiated_version(self.ts_request_version);
                     ts_request.pub_key_auth = Some(
                         self.context
                             .as_mut()
@@ -362,10 +363,22 @@ impl CredSspClient {
                                 self.public_key.as_ref(),
                                 EndpointType::Client,
                                 &Some(self.client_nonce),
-                                peer_version,
+                                negotiated_version,
                             )?,
                     );
-                    ts_request.client_nonce = Some(self.client_nonce);
+                    // The `clientNonce` field was introduced in CredSSP version 5, together with the
+                    // hash-based `pubKeyAuth` computation that consumes it. A peer that predates it
+                    // (Windows Server 2008 R2 advertises version 2 or 3) decodes TSRequest against a
+                    // definition which has no `[5]` field at all, so an unexpected contextual tag can
+                    // make the whole structure fail to parse. The failure surfaces as a dropped TLS
+                    // session rather than a `TSRequest.errorCode`, because the peer never gets far
+                    // enough to build a CredSSP-level response.
+                    //
+                    // `encrypt_public_key` above already falls back to the legacy public key echo for
+                    // pre-5 peers; the nonce it is handed goes unused in that path.
+                    if negotiated_version >= 5 {
+                        ts_request.client_nonce = Some(self.client_nonce);
+                    }
 
                     if let Some(nego_tokens) = &ts_request.nego_tokens
                         && nego_tokens.is_empty()
@@ -387,18 +400,17 @@ impl CredSspClient {
                         String::from("CredSSP client expected an encrypted public key"),
                     )
                 })?;
-                let peer_version = self
+                let negotiated_version = self
                     .context
                     .as_ref()
                     .expect("Should not panic because the CredSSP context is set before")
-                    .peer_version
-                    .expect("An decrypt public key client function cannot be fired without any incoming TSRequest");
+                    .negotiated_version(self.ts_request_version);
                 self.context.as_mut().unwrap().decrypt_public_key(
                     self.public_key.as_ref(),
                     pub_key_auth.as_ref(),
                     EndpointType::Client,
                     &Some(self.client_nonce),
-                    peer_version,
+                    negotiated_version,
                 )?;
 
                 ts_request.auth_info = Some(
@@ -492,12 +504,11 @@ impl<C: CredentialsProxy<AuthenticationData = AuthIdentity> + Send> CredSspServe
         pub_key_auth: &[u8],
         client_nonce: &Option<[u8; NONCE_SIZE]>,
     ) -> crate::Result<Vec<u8>> {
-        let peer_version = self
+        let negotiated_version = self
             .context
             .as_ref()
-            .unwrap()
-            .peer_version
-            .expect("a decrypt public key server function cannot be fired without any incoming TSRequest");
+            .expect("Should not panic because the CredSSP context is set before")
+            .negotiated_version(self.ts_request_version);
 
         let context = self.context.as_mut().unwrap();
 
@@ -506,10 +517,10 @@ impl<C: CredentialsProxy<AuthenticationData = AuthIdentity> + Send> CredSspServe
             pub_key_auth,
             EndpointType::Server,
             client_nonce,
-            peer_version,
+            negotiated_version,
         )?;
 
-        context.encrypt_public_key(&self.public_key, EndpointType::Server, client_nonce, peer_version)
+        context.encrypt_public_key(&self.public_key, EndpointType::Server, client_nonce, negotiated_version)
     }
 
     #[instrument(fields(state = ?self.state), skip_all)]
@@ -1223,19 +1234,41 @@ impl CredSspContext {
         }
     }
 
+    /// Returns the CredSSP version both endpoints are able to speak.
+    ///
+    /// [MS-CSSP 3.1.5 Processing Events and Sequencing Rules](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-cssp/385a7489-d46b-464c-b224-f7340e308a5c):
+    /// > If the client and the server do not support the same version of the CredSSP Protocol, then
+    /// > the client and the server MUST use the minimum of the two versions.
+    ///
+    /// Every version-gated behaviour -- the `clientNonce` field and the hash-based `pubKeyAuth`
+    /// computation that consumes it -- must key off this rather than off either side's advertised
+    /// version alone, otherwise the two endpoints disagree about the wire format.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no TSRequest has been received yet, which would be a state machine bug: the peer
+    /// version is recorded by [`Self::check_peer_version`] on every inbound TSRequest.
+    fn negotiated_version(&self, own_version: u32) -> u32 {
+        let peer_version = self
+            .peer_version
+            .expect("the peer version is recorded from the first incoming TSRequest");
+
+        own_version.min(peer_version)
+    }
+
     fn encrypt_public_key(
         &mut self,
         public_key: &[u8],
         endpoint: EndpointType,
         client_nonce: &Option<[u8; NONCE_SIZE]>,
-        peer_version: u32,
+        negotiated_version: u32,
     ) -> crate::Result<Vec<u8>> {
         let hash_magic = match endpoint {
             EndpointType::Client => CLIENT_SERVER_HASH_MAGIC,
             EndpointType::Server => SERVER_CLIENT_HASH_MAGIC,
         };
 
-        if peer_version < 5 {
+        if negotiated_version < 5 {
             self.encrypt_public_key_echo(public_key, endpoint)
         } else {
             self.encrypt_public_key_hash(
@@ -1255,14 +1288,14 @@ impl CredSspContext {
         encrypted_public_key: &[u8],
         endpoint: EndpointType,
         client_nonce: &Option<[u8; NONCE_SIZE]>,
-        peer_version: u32,
+        negotiated_version: u32,
     ) -> crate::Result<()> {
         let hash_magic = match endpoint {
             EndpointType::Client => SERVER_CLIENT_HASH_MAGIC,
             EndpointType::Server => CLIENT_SERVER_HASH_MAGIC,
         };
 
-        if peer_version < 5 {
+        if negotiated_version < 5 {
             self.decrypt_public_key_echo(public_key, encrypted_public_key, endpoint)
         } else {
             self.decrypt_public_key_hash(
